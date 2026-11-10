@@ -1,0 +1,33 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Cache embedded Postgres binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.amp/test-cache
+          key: embedded-postgres-v17
+      - run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+      # Unit tests plus the lifecycle integration tests (they start an embedded Postgres).
+      - run: go test -count=1 ./...
+      - run: go build ./cmd/...
+      - name: Smoke test the full binary
+        run: |
+          go build -o amp ./cmd/amp
+          ./amp serve --embedded-db --data-dir "$RUNNER_TEMP/amp" &
+          for i in $(seq 1 60); do curl -sf localhost:8080/healthz && break; sleep 1; done
+          ./amp module install evaluation --with-deps
+          ./amp module install ai-gateway
+          ./amp module list
+          curl -sf localhost:8080/api/ui-manifest | grep -q '"evaluation"'
