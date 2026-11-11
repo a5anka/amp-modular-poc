@@ -267,6 +267,9 @@ func TestModuleLifecycle(t *testing.T) {
 	})
 
 	t.Run("purge drops schema and role", func(t *testing.T) {
+		if _, err := pool.Exec(ctx, `INSERT INTO core.workload_credentials (module, workload, secret_hash) VALUES ('t-consumer', 'w', 'h')`); err != nil {
+			t.Fatal(err)
+		}
 		if err := h1.Uninstall(ctx, "t-consumer", true); err != nil {
 			t.Fatal(err)
 		}
@@ -277,6 +280,11 @@ func TestModuleLifecycle(t *testing.T) {
 		_ = pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'amp_mod_t_consumer')`).Scan(&role)
 		if role {
 			t.Fatal("role still there after purge")
+		}
+		var live int
+		_ = pool.QueryRow(ctx, `SELECT count(*) FROM core.workload_credentials WHERE module = 't-consumer' AND revoked_at IS NULL`).Scan(&live)
+		if live != 0 {
+			t.Fatal("purge must revoke the module's workload credentials")
 		}
 	})
 }

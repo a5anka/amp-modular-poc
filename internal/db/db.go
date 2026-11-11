@@ -256,6 +256,13 @@ func DropModuleSchema(ctx context.Context, tx pgx.Tx, module string) error {
 			}
 		}
 	}
-	_, err := tx.Exec(ctx, `DELETE FROM core.module_migrations WHERE module = $1`, module)
+	if _, err := tx.Exec(ctx, `DELETE FROM core.module_migrations WHERE module = $1`, module); err != nil {
+		return err
+	}
+	// Purge also revokes the module's workload credentials and forgets its instances.
+	if _, err := tx.Exec(ctx, `UPDATE core.workload_credentials SET revoked_at = now() WHERE module = $1 AND revoked_at IS NULL`, module); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `DELETE FROM core.workload_instances WHERE module = $1`, module)
 	return err
 }
