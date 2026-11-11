@@ -61,7 +61,7 @@ func usage(dist string) {
 	fmt.Fprintf(os.Stderr, `%s
 
 Usage:
-  amp serve [--addr :8080] [--db postgres://...] [--embedded-db] [--replica name]
+  amp serve [--addr :8080] [--db postgres://...] [--embedded-db] [--replica name] [--poll-interval 1s]
   amp module list
   amp module info <name>
   amp module install <name> [--with-deps]
@@ -87,6 +87,7 @@ func serve(args []string) error {
 	embedded := fs.Bool("embedded-db", false, "start a local Postgres for development (no Docker needed)")
 	dataDir := fs.String("data-dir", envOr("AMP_DATA_DIR", defaultDataDir()), "embedded Postgres data directory")
 	replica := fs.String("replica", os.Getenv("AMP_REPLICA"), "replica name shown in logs and the console")
+	poll := fs.Duration("poll-interval", envDuration("AMP_POLL_INTERVAL", modhost.DefaultPollInterval), "how often to check for module changes made by other replicas")
 	devWorkers := fs.Bool("dev-workers", false, "run modules' workloads in-process (development only: no isolation)")
 	_ = fs.Parse(args)
 
@@ -123,6 +124,7 @@ func serve(args []string) error {
 	}
 	agents := core.NewAgents(pool)
 	host := modhost.New(pool, *dsn, agents, log)
+	host.PollInterval = *poll
 	if err := host.Boot(ctx); err != nil {
 		return fmt.Errorf("module host: %w", err)
 	}
@@ -303,7 +305,7 @@ func moduleCmd(args []string) error {
 				}
 			}
 		}
-		fmt.Printf("active on all replicas at generation %d (%s); open consoles update without a reload\n",
+		fmt.Printf("active at generation %d (%s); other replicas pick it up on their next poll, and open consoles update without a reload\n",
 			res.Generation, time.Since(start).Round(time.Millisecond))
 		if len(next) > 0 {
 			time.Sleep(1500 * time.Millisecond)
@@ -447,4 +449,13 @@ func (c *client) do(method, path string, body, out any) error {
 		return json.Unmarshal(b, out)
 	}
 	return nil
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
 }

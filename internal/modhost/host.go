@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,7 +40,9 @@ var (
 	Roles = []string{"admin", "developer", "viewer"}
 )
 
-const notifyChannel = "amp_modules"
+// DefaultPollInterval is how often a replica checks core.generation for
+// lifecycle changes made by other replicas.
+const DefaultPollInterval = time.Second
 
 // Host is the module host. One per process.
 type Host struct {
@@ -70,6 +71,12 @@ type Host struct {
 	devMu   sync.Mutex
 	devURL  string
 	devRuns map[string]context.CancelFunc
+
+	// PollInterval is how often this replica checks core.generation for
+	// changes made elsewhere. Set it before Boot; zero means DefaultPollInterval.
+	PollInterval time.Duration
+
+	reloadMu sync.Mutex // one Reload at a time (poller and local changes)
 
 	Bus *Broadcaster
 }
@@ -278,46 +285,43 @@ func bump(ctx context.Context, tx pgx.Tx) (int64, error) {
 	if err := tx.QueryRow(ctx, `UPDATE core.generation SET value = value + 1 RETURNING value`).Scan(&g); err != nil {
 		return 0, err
 	}
-	// Delivered to every replica when the transaction commits.
-	_, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, notifyChannel, strconv.FormatInt(g, 10))
-	return g, err
+	// Other replicas see the new value on their next poll, once this commits.
+	return g, nil
 }
 
-// follow listens for lifecycle changes committed by any replica.
+// follow polls core.generation and reloads when another replica has changed
+// the module set. Polling is a single-row read per interval, works on any
+// database, and needs no notification channel: a replica that missed changes
+// (restart, network blip) catches up on its next tick.
 func (h *Host) follow(ctx context.Context) {
-	backoff := time.Second
-	for ctx.Err() == nil {
-		err := h.listenOnce(ctx)
-		if ctx.Err() != nil {
-			return
-		}
-		h.log.Warn("module change listener stopped, retrying", "err", err, "in", backoff)
-		time.Sleep(backoff)
-		if backoff < 30*time.Second {
-			backoff *= 2
-		}
+	every := h.PollInterval
+	if every <= 0 {
+		every = DefaultPollInterval
 	}
-}
-
-func (h *Host) listenOnce(ctx context.Context) error {
-	conn, err := pgx.Connect(ctx, h.dsn)
-	if err != nil {
-		return err
-	}
-	defer conn.Close(context.Background())
-	if _, err := conn.Exec(ctx, "LISTEN "+notifyChannel); err != nil {
-		return err
-	}
-	// Catch anything committed while we were not listening.
-	if err := h.Reload(ctx); err != nil {
-		h.log.Error("reload failed", "err", err)
-	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	failing := false
 	for {
-		n, err := conn.WaitForNotification(ctx)
-		if err != nil {
-			return err
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
 		}
-		g, _ := strconv.ParseInt(n.Payload, 10, 64)
+		var g int64
+		if err := h.pool.QueryRow(ctx, `SELECT value FROM core.generation`).Scan(&g); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if !failing {
+				h.log.Warn("cannot read module generation; keeping the current module set", "err", err)
+				failing = true
+			}
+			continue
+		}
+		if failing {
+			h.log.Info("module generation readable again")
+			failing = false
+		}
 		if g <= h.Generation() {
 			continue
 		}
@@ -330,6 +334,8 @@ func (h *Host) listenOnce(ctx context.Context) error {
 
 // Reload rebuilds the registrations of the active modules and swaps them in.
 func (h *Host) Reload(ctx context.Context) error {
+	h.reloadMu.Lock()
+	defer h.reloadMu.Unlock()
 	rs, err := loadStates(ctx, h.pool)
 	if err != nil {
 		return err
@@ -400,7 +406,7 @@ func qualify(module, perm string) string {
 // ---- lifecycle ----
 
 // change runs fn under the cluster-wide lifecycle lock, bumps the generation,
-// commits, and reloads this replica. Other replicas reload on the notification.
+// commits, and reloads this replica. Other replicas reload on their next poll.
 func (h *Host) change(ctx context.Context, fn func(tx pgx.Tx, states map[string]string) error) error {
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {

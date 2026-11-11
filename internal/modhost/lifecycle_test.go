@@ -195,6 +195,43 @@ func TestModuleLifecycle(t *testing.T) {
 		}
 	})
 
+	t.Run("replicas poll: a change with no notification still propagates", func(t *testing.T) {
+		// Change the module state straight in the database, the way a restore
+		// or an operator script would. Nothing tells the replicas; polling must.
+		set := func(state string) {
+			t.Helper()
+			if _, err := pool.Exec(ctx, `UPDATE core.modules SET state = $1 WHERE name = 't-store'`, state); err != nil {
+				t.Fatal(err)
+			}
+			var g int64
+			if err := pool.QueryRow(ctx, `UPDATE core.generation SET value = value + 1 RETURNING value`).Scan(&g); err != nil {
+				t.Fatal(err)
+			}
+			for _, h := range []*modhost.Host{h1, h2} {
+				deadline := time.Now().Add(5 * time.Second)
+				for h.Generation() < g {
+					if time.Now().After(deadline) {
+						t.Fatalf("replica stuck at generation %d, database at %d", h.Generation(), g)
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+			}
+		}
+		code := func(h *modhost.Host) int {
+			rec := httptest.NewRecorder()
+			h.ServeModule(rec, httptest.NewRequest("GET", "/m/t-store/items", nil))
+			return rec.Code
+		}
+		set("disabled")
+		if c1, c2 := code(h1), code(h2); c1 != 404 || c2 != 404 {
+			t.Fatalf("disabled module still served: replica1=%d replica2=%d", c1, c2)
+		}
+		set("active")
+		if c1, c2 := code(h1), code(h2); c1 != 200 || c2 != 200 {
+			t.Fatalf("re-enabled module not served: replica1=%d replica2=%d", c1, c2)
+		}
+	})
+
 	t.Run("module role sees its schema and core_api only", func(t *testing.T) {
 		mp, err := db.ModulePool(ctx, dsn, "t-store")
 		if err != nil {

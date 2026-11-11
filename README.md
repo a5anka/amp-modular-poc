@@ -31,7 +31,7 @@ Workloads never touch the database. They lease work and post results over the mo
 | Tight integration with the core | ai-gateway adds a field to the core create-agent form, validates it in a hook, stores it on `agent.created`, renders a section on the agent page, and cleans up in a finalize hook |
 | Integration between modules | evaluation **requires** `traces.query/v1` (observability) and **optionally** uses `llm.proxy/v1` (ai-gateway). It fills a slot that observability owns (the Score column) |
 | Dependency safety | Install refuses missing dependencies (or resolves them with `--with-deps`). Disable and uninstall refuse while a dependent needs the module |
-| Multi-replica | One replica installs; the others reload on Postgres `LISTEN/NOTIFY`. An advisory lock serialises lifecycle changes and migrations |
+| Multi-replica | One replica installs; the others notice within a second by polling `core.generation` (`--poll-interval`). An advisory lock serialises lifecycle changes and migrations |
 | Upgrade on deploy | A new binary with a new migration upgrades the module on boot. Editing an applied migration is refused |
 | Catch-up on late install | observability backfills traces for agents that existed before it was installed |
 | Permissions from modules | Modules declare permissions and grant them to core roles. `/api/me`, the API and the UI all follow |
@@ -242,7 +242,7 @@ available --install--> active <--enable/disable--> disabled
                            +---uninstall --purge--> available (schema + role dropped)
 ```
 
-Every change takes `pg_advisory_xact_lock`, applies DDL and the state change in one transaction, and bumps `core.generation`. It then calls `pg_notify('amp_modules', gen)`. Each replica rebuilds an immutable snapshot of routes, hooks, subscriptions, capabilities and grants, and swaps it in atomically. Open consoles are told over SSE and re-render.
+Every change takes `pg_advisory_xact_lock`, applies DDL and the state change in one transaction, and bumps `core.generation`. The replica that made the change reloads at once. Every other replica reads `core.generation` once per poll interval (default 1 s, `--poll-interval` or `AMP_POLL_INTERVAL`) and reloads when it has moved. Polling is one single-row read per replica per interval, works on any database, and catches up after a restart or a missed change. On reload, a replica rebuilds an immutable snapshot of routes, hooks, subscriptions, capabilities and grants, and swaps it in atomically. Open consoles are told over SSE and re-render.
 
 **Upgrading** means shipping a new binary whose module version has new migration files. On boot, under the same lock, the core applies any pending migrations for installed modules. Use expand/contract migrations, so that old and new replicas can run side by side during a rolling deploy. Applied files are checksummed and must never be edited.
 
@@ -301,7 +301,7 @@ A GitHub Actions workflow runs `gofmt`, `go vet`, the tests and a smoke test of 
 | permissions declared by modules | fixed `FeatureAccessConfig` and `rbac/predefined_roles.go` |
 | slots declared by the core and by modules | fixed `MountPoints` enum, page packages imported at build time |
 | console served by the binary (`go:embed`) | separate nginx container |
-| `LISTEN/NOTIFY` reload | NATS available (embedded or external) and could carry `modules.changed` |
+| Polling `core.generation` | Nothing equivalent today; a NATS `modules.changed` message could shorten the delay later, with polling kept as the safety net |
 | evaluation workloads (`eval-controller`, `shared-worker`, isolated jobs) with run tokens | `monitor_executor`/`monitor_scheduler` in the service, `evaluation-job` launched through OpenChoreo workflows; the eval execution redesign proposes the same split |
 
 ## License
