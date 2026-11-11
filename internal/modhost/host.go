@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -125,13 +127,19 @@ func newView() *view {
 
 // New creates the host for the modules compiled into this binary.
 func New(pool *pgxpool.Pool, dsn string, core modkit.CoreAPI, log *slog.Logger) *Host {
+	return NewWith(pool, dsn, core, log, modkit.Registered())
+}
+
+// NewWith creates a host for an explicit set of modules (tests use it to
+// stand in for a different binary).
+func NewWith(pool *pgxpool.Pool, dsn string, core modkit.CoreAPI, log *slog.Logger, mods []modkit.Module) *Host {
 	h := &Host{
 		pool: pool, dsn: dsn, log: log, core: core,
 		mods: map[string]modkit.Module{}, manifests: map[string]modkit.Manifest{},
 		pools: map[string]*pgxpool.Pool{}, states: map[string]string{}, dbVer: map[string]string{},
 		v: newView(), Bus: NewBroadcaster(), tags: map[string]string{}, devRuns: map[string]context.CancelFunc{},
 	}
-	for _, m := range modkit.Registered() {
+	for _, m := range mods {
 		mf := m.Manifest()
 		h.mods[mf.Name] = m
 		h.manifests[mf.Name] = mf
@@ -204,15 +212,16 @@ func flatten(rs map[string]rowState) map[string]string {
 	return out
 }
 
-// Boot upgrades installed modules whose compiled version carries new
-// migrations, loads the active set, and starts following lifecycle changes
-// made by other replicas.
+// Boot checks that the database schema matches this binary, loads the active
+// set, and starts following lifecycle changes made by other replicas. It
+// never changes the schema: that is Migrate's job, run once per core install
+// or upgrade (amp migrate, or serve's default --migrate=true).
 func (h *Host) Boot(ctx context.Context) error {
+	if err := h.CheckSchema(ctx); err != nil {
+		return err
+	}
 	if err := h.loadKeys(ctx); err != nil {
 		return fmt.Errorf("signing keys: %w", err)
-	}
-	if err := h.upgradeInstalled(ctx); err != nil {
-		return err
 	}
 	if err := h.Reload(ctx); err != nil {
 		return err
@@ -221,63 +230,144 @@ func (h *Host) Boot(ctx context.Context) error {
 	return nil
 }
 
-func (h *Host) upgradeInstalled(ctx context.Context) error {
+// MigrationResult is what Migrate did for one module.
+type MigrationResult struct {
+	Module  string `json:"module"`
+	Schema  string `json:"schema"`
+	Applied int    `json:"applied"`
+	Total   int    `json:"total"`
+}
+
+// Migrate brings the database schema up to this binary: the core's own
+// migrations, then the schema, role and migrations of EVERY module compiled
+// in, installed or not. It is the only code path that runs DDL. Installing,
+// enabling, disabling and purging a module afterwards are data changes only.
+//
+// Each module migrates in its own transaction under the migration lock, so
+// replicas started together do not race and a failing module leaves nothing
+// half-applied. Modules that are installed also get their recorded version
+// moved to the compiled one.
+func (h *Host) Migrate(ctx context.Context) ([]MigrationResult, error) {
+	if err := db.Bootstrap(ctx, h.pool); err != nil {
+		return nil, fmt.Errorf("core migrations: %w", err)
+	}
+	names := make([]string, 0, len(h.mods))
+	for n := range h.mods {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	var out []MigrationResult
+	for _, name := range names {
+		r, err := h.migrateModule(ctx, name)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func (h *Host) migrateModule(ctx context.Context, name string) (MigrationResult, error) {
+	res := MigrationResult{Module: name, Schema: db.SchemaName(name)}
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return res, err
 	}
 	defer tx.Rollback(ctx)
 	if err := db.Lock(ctx, tx); err != nil {
-		return err
+		return res, err
 	}
-	rs, err := loadStates(ctx, tx)
-	if err != nil {
-		return err
-	}
-	changed := false
-	for name, r := range rs {
-		m, ok := h.mods[name]
-		if !ok || r.state == StateUninstalled {
-			continue
-		}
-		n, err := h.migrate(ctx, tx, name, m)
-		if err != nil {
-			return err
-		}
-		mf := h.manifests[name]
-		if n > 0 || r.version != mf.Version {
-			h.log.Info("module upgraded", "module", name, "from", r.version, "to", mf.Version, "migrations", n)
-			if _, err := tx.Exec(ctx, `UPDATE core.modules SET version = $2, updated_at = now() WHERE name = $1`, name, mf.Version); err != nil {
-				return err
-			}
-			changed = true
-		}
-	}
-	if changed {
-		if _, err := bump(ctx, tx); err != nil {
-			return err
-		}
-	}
-	return tx.Commit(ctx)
-}
-
-// migrate makes sure the module schema exists and applies pending migrations.
-func (h *Host) migrate(ctx context.Context, tx pgx.Tx, name string, m modkit.Module) (int, error) {
 	if err := db.EnsureModuleSchema(ctx, tx, name); err != nil {
-		return 0, err
+		return res, err
 	}
-	ms, err := db.Load(m.Migrations())
+	ms, err := db.Load(h.mods[name].Migrations())
 	if err != nil {
-		return 0, err
+		return res, err
 	}
 	pending, err := db.Pending(ctx, tx, name, ms)
 	if err != nil {
-		return 0, err
+		return res, err
 	}
 	if err := db.Apply(ctx, tx, name, pending, db.RoleName(name)); err != nil {
-		return 0, err
+		return res, err
 	}
-	return len(pending), nil
+	res.Applied, res.Total = len(pending), len(ms)
+	mf := h.manifests[name]
+	tag, err := tx.Exec(ctx, `UPDATE core.modules SET version = $2, updated_at = now()
+		WHERE name = $1 AND version <> $2 AND state <> 'uninstalled'`, name, mf.Version)
+	if err != nil {
+		return res, err
+	}
+	if tag.RowsAffected() > 0 {
+		h.log.Info("module upgraded", "module", name, "to", mf.Version, "migrations", len(pending))
+		if _, err := bump(ctx, tx); err != nil {
+			return res, err
+		}
+	}
+	return res, tx.Commit(ctx)
+}
+
+// SchemaBehindError means the database has not been migrated for this binary.
+type SchemaBehindError struct{ Pending map[string]int }
+
+func (e *SchemaBehindError) Error() string {
+	var parts []string
+	for _, n := range slices.Sorted(maps.Keys(e.Pending)) {
+		parts = append(parts, fmt.Sprintf("%s: %d", n, e.Pending[n]))
+	}
+	return "the database schema is behind this binary (pending migrations: " + strings.Join(parts, ", ") +
+		"); run `amp migrate` (or start serve with --migrate)"
+}
+
+// CheckSchema verifies that every migration of the core and of every
+// compiled-in module has been applied, and that none was edited since.
+// Migrations recorded in the database but unknown to this binary are fine:
+// that is an older replica during a rolling upgrade.
+func (h *Host) CheckSchema(ctx context.Context) error {
+	pending := map[string]int{}
+	n, err := db.CorePending(ctx, h.pool)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		pending["core"] = n
+		return &SchemaBehindError{Pending: pending}
+	}
+	for name, m := range h.mods {
+		ms, err := db.Load(m.Migrations())
+		if err != nil {
+			return err
+		}
+		p, err := db.Pending(ctx, h.pool, name, ms)
+		if err != nil {
+			return err
+		}
+		if len(p) > 0 {
+			pending[name] = len(p)
+		}
+	}
+	if len(pending) > 0 {
+		return &SchemaBehindError{Pending: pending}
+	}
+	return nil
+}
+
+// schemaReady is the install/enable precondition: the module's migrations
+// must already have been applied by Migrate.
+func (h *Host) schemaReady(ctx context.Context, tx pgx.Tx, name string) error {
+	ms, err := db.Load(h.mods[name].Migrations())
+	if err != nil {
+		return err
+	}
+	p, err := db.Pending(ctx, tx, name, ms)
+	if err != nil {
+		return err
+	}
+	if len(p) > 0 {
+		return &ResolveError{Msg: fmt.Sprintf("%s has %d migration(s) not applied to this database", name, len(p)),
+			Hint: "run `amp migrate` with this binary first (module tables are created at core install or upgrade, not at module install)"}
+	}
+	return nil
 }
 
 func bump(ctx context.Context, tx pgx.Tx) (int64, error) {
@@ -405,15 +495,17 @@ func qualify(module, perm string) string {
 
 // ---- lifecycle ----
 
-// change runs fn under the cluster-wide lifecycle lock, bumps the generation,
-// commits, and reloads this replica. Other replicas reload on their next poll.
+// change runs fn as one ordinary transaction, bumps the generation, commits,
+// and reloads this replica. Other replicas reload on their next poll.
+// Lifecycle changes are data changes only (no DDL), so a row lock on the
+// generation counter is enough to serialise them, on any database.
 func (h *Host) change(ctx context.Context, fn func(tx pgx.Tx, states map[string]string) error) error {
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if err := db.Lock(ctx, tx); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT value FROM core.generation FOR UPDATE`); err != nil {
 		return err
 	}
 	rs, err := loadStates(ctx, tx)
@@ -445,7 +537,7 @@ func (h *Host) Install(ctx context.Context, name string, withDeps bool) ([]Step,
 			return err
 		}
 		for _, s := range steps {
-			if _, err := h.migrate(ctx, tx, s.Module, h.mods[s.Module]); err != nil {
+			if err := h.schemaReady(ctx, tx, s.Module); err != nil {
 				return err
 			}
 			if _, err := tx.Exec(ctx, `
@@ -475,7 +567,7 @@ func (h *Host) Install(ctx context.Context, name string, withDeps bool) ([]Step,
 	return steps, nil
 }
 
-// Enable re-activates a disabled module, applying any migrations added since.
+// Enable re-activates a disabled module.
 func (h *Host) Enable(ctx context.Context, name string) error {
 	return h.change(ctx, func(tx pgx.Tx, states map[string]string) error {
 		if states[name] != StateDisabled {
@@ -484,7 +576,7 @@ func (h *Host) Enable(ctx context.Context, name string) error {
 		if _, err := Plan(name, h.manifests, states, false); err != nil {
 			return err
 		}
-		if _, err := h.migrate(ctx, tx, name, h.mods[name]); err != nil {
+		if err := h.schemaReady(ctx, tx, name); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `UPDATE core.modules SET state = 'active', version = $2, updated_at = now() WHERE name = $1`,
@@ -507,10 +599,12 @@ func (h *Host) Disable(ctx context.Context, name string) error {
 	})
 }
 
-// Uninstall removes a module. Without purge its schema and data stay, so a
-// later install picks up where it left off; with purge they are dropped.
+// Uninstall removes a module. Without purge its data stays, so a later install
+// picks up where it left off. With purge its tables are emptied and its
+// workload credentials revoked; the schema, role and tables themselves stay,
+// because they belong to the binary, not to the install.
 func (h *Host) Uninstall(ctx context.Context, name string, purge bool) error {
-	err := h.change(ctx, func(tx pgx.Tx, states map[string]string) error {
+	return h.change(ctx, func(tx pgx.Tx, states map[string]string) error {
 		st := stateOf(name, states)
 		if st == StateAvailable || (st == StateUninstalled && !purge) {
 			return &ResolveError{Msg: name + " is not installed"}
@@ -522,16 +616,12 @@ func (h *Host) Uninstall(ctx context.Context, name string, purge bool) error {
 			_, err := tx.Exec(ctx, `UPDATE core.modules SET state = 'uninstalled', updated_at = now() WHERE name = $1`, name)
 			return err
 		}
-		if err := db.DropModuleSchema(ctx, tx, name); err != nil {
+		if err := db.PurgeModuleData(ctx, tx, name); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `DELETE FROM core.modules WHERE name = $1`, name)
 		return err
 	})
-	if err == nil && purge {
-		h.closeModulePool(name)
-	}
-	return err
 }
 
 // ---- runtime used by modules ----

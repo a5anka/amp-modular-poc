@@ -34,8 +34,22 @@ var ui embed.FS
 
 func init() { modkit.Register(&Module{}) }
 
-// Module implements modkit.Module.
+// Module implements modkit.Module and modkit.Installer.
 type Module struct{}
+
+// OnInstall implements modkit.Installer. It (re)creates the default providers.
+// Migrations create structure; reference data belongs here, so it is restored
+// when the module is installed again after a purge (which empties the tables
+// but does not re-run migrations). 0001_init.sql still seeds them on a fresh
+// database: applied migrations are never edited.
+func (*Module) OnInstall(ctx context.Context, rt modkit.Runtime) error {
+	_, err := rt.DB().Exec(ctx, `
+		INSERT INTO llm_providers (name, kind, base_url, models) VALUES
+		    ('openai',    'openai',    'https://api.openai.com/v1', ARRAY['gpt-4.1', 'gpt-4.1-mini']),
+		    ('anthropic', 'anthropic', 'https://api.anthropic.com', ARRAY['claude-sonnet-4-5', 'claude-haiku-4-5'])
+		ON CONFLICT (name) DO NOTHING`)
+	return err
+}
 
 // Manifest implements modkit.Module.
 func (*Module) Manifest() modkit.Manifest {

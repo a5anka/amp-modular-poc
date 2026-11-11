@@ -1,8 +1,12 @@
 # Agent Manager: modular core PoC
 
-A proof of concept for a modular Agent Manager. It is one Go binary that persists to Postgres and serves its own console. First-party modules are compiled into that binary but stay dormant until you install them. Installing a module:
+A proof of concept for a modular Agent Manager. It is one Go binary that persists to Postgres and serves its own console. First-party modules are compiled into that binary but stay dormant until you install them.
 
-1. creates the module's own database schema and role, and runs its migrations;
+The database schema follows the binary. `amp migrate` (run at core install and on every upgrade, or by `amp serve` on start) creates the schema, role and tables of the core and of **every** compiled-in module, installed or not. It is the only step that runs DDL.
+
+Installing a module is then a data change only. It:
+
+1. marks the module active (one row, one ordinary transaction);
 2. mounts its API under `/m/<module>`;
 3. registers its hooks, event handlers, capabilities and permissions;
 4. adds its pages and slot components to the console.
@@ -24,15 +28,16 @@ Workloads never touch the database. They lease work and post results over the mo
 | Design point | Where to see it |
 |---|---|
 | Single binary; core runs on its own | `amp-core` (no modules linked) and `amp` (all modules) both run on the same database |
-| Install creates the module's DB | `mod_<name>` schema + `amp_mod_<name>` role per module; module SQL runs as that role |
+| Schema at core install, not module install | `amp migrate` creates a `mod_<name>` schema + `amp_mod_<name>` role per compiled-in module and runs its SQL as that role. Install, enable, disable and purge run no DDL |
 | Data isolation | A module can read the `core_api` views. It cannot read `core.*` tables or another module's schema (enforced by the DB, covered by tests) |
-| Atomic install | Schema, migrations and registration happen in one transaction. A failing migration leaves nothing behind |
+| Atomic migrations, cheap installs | Each module migrates in its own transaction under an advisory lock; a failing migration leaves nothing behind. Install is one row update under a row lock |
+| Schema check on start | `amp serve --migrate=false` refuses to start if any migration of this binary is missing, and tells you to run `amp migrate` |
 | UI updates without a rebuild | The shell loads module ESM bundles at runtime through an import map. Nav, pages and slots appear and disappear live over SSE |
 | Tight integration with the core | ai-gateway adds a field to the core create-agent form, validates it in a hook, stores it on `agent.created`, renders a section on the agent page, and cleans up in a finalize hook |
 | Integration between modules | evaluation **requires** `traces.query/v1` (observability) and **optionally** uses `llm.proxy/v1` (ai-gateway). It fills a slot that observability owns (the Score column) |
 | Dependency safety | Install refuses missing dependencies (or resolves them with `--with-deps`). Disable and uninstall refuse while a dependent needs the module |
-| Multi-replica | One replica installs; the others notice within a second by polling `core.generation` (`--poll-interval`). An advisory lock serialises lifecycle changes and migrations |
-| Upgrade on deploy | A new binary with a new migration upgrades the module on boot. Editing an applied migration is refused |
+| Multi-replica | One replica installs; the others notice within a second by polling `core.generation` (`--poll-interval`). Lifecycle changes lock the `core.generation` row; only migrations use the advisory lock |
+| Upgrade on deploy | `amp migrate` with a new binary applies its new migrations and records installed modules' new version. Editing an applied migration is refused |
 | Catch-up on late install | observability backfills traces for agents that existed before it was installed |
 | Permissions from modules | Modules declare permissions and grant them to core roles. `/api/me`, the API and the UI all follow |
 | Workloads outside the binary | evaluation declares `eval-controller`, `shared-worker` and a per-run `custom-evaluator` job. Without them it is active but **degraded**, and runs wait in the queue |
@@ -50,7 +55,14 @@ git clone https://github.com/a5anka/amp-modular-poc.git
 cd amp-modular-poc
 go build -o bin/ ./cmd/...
 
-./bin/amp serve --embedded-db          # terminal 1, then open http://localhost:8080
+./bin/amp serve --embedded-db          # terminal 1 (migrates on start), then open http://localhost:8080
+```
+
+`serve` migrates on start by default, which is what you want on a laptop. With several replicas, run the migration once, before they start, and serve with `--migrate=false`:
+
+```bash
+./bin/amp migrate --db "$AMP_DB_URL"      # Kubernetes: a Helm pre-install/pre-upgrade Job; compose: the "migrate" service
+AMP_MIGRATE=false ./bin/amp serve --db "$AMP_DB_URL"
 ```
 
 In a second terminal, with the console open next to it:
@@ -63,7 +75,7 @@ In a second terminal, with the console open next to it:
 ./bin/amp module disable ai-gateway              # LLM Providers page disappears; evaluation falls back to its heuristic judge
 ./bin/amp module enable ai-gateway
 ./bin/amp module uninstall ai-gateway            # data kept, reinstall resumes
-./bin/amp module uninstall ai-gateway --purge    # schema dropped
+./bin/amp module uninstall ai-gateway --purge    # tables emptied, schema kept; reinstall needs no migration
 ```
 
 ### Evaluation workloads
@@ -130,7 +142,7 @@ cmd/amp-core       core only
 cmd/amp-eval-worker evaluation workloads: controller | shared-worker | launcher
 modkit/            the module contract: Module, Manifest, Runtime, Register()
 modkit/contracts/  versioned capability contracts (tracesv1, llmv1)
-internal/db        pools, per-module schema/role, SQL migrator, advisory lock
+internal/db        pools, per-module schema/role, SQL migrator (advisory lock), purge
 internal/modhost   registry, resolver, lifecycle, live registrations, UI manifest, SSE
 internal/core      HTTP API, agent registry (core resource), hooks into agent create/delete
 internal/cli       `amp serve` and `amp module ...`
@@ -239,12 +251,12 @@ Workloads: []modkit.Workload{
 available --install--> active <--enable/disable--> disabled
                           \                          /
                            +---uninstall (keep)---> uninstalled --install--> active (resumes)
-                           +---uninstall --purge--> available (schema + role dropped)
+                           +---uninstall --purge--> available (tables emptied, schema kept)
 ```
 
-Every change takes `pg_advisory_xact_lock`, applies DDL and the state change in one transaction, and bumps `core.generation`. The replica that made the change reloads at once. Every other replica reads `core.generation` once per poll interval (default 1 s, `--poll-interval` or `AMP_POLL_INTERVAL`) and reloads when it has moved. Polling is one single-row read per replica per interval, works on any database, and catches up after a restart or a missed change. On reload, a replica rebuilds an immutable snapshot of routes, hooks, subscriptions, capabilities and grants, and swaps it in atomically. Open consoles are told over SSE and re-render.
+A lifecycle change is one ordinary transaction: it locks the `core.generation` row (`SELECT … FOR UPDATE`), checks dependencies, updates `core.modules`, and bumps the generation. It runs no DDL, because `amp migrate` already created every compiled-in module's tables; it refuses if they are missing. Seed data a module needs on every install goes in `OnInstall`, not in a migration, because purge empties the tables and does not re-run migrations (ai-gateway re-creates its default providers this way). The replica that made the change reloads at once. Every other replica reads `core.generation` once per poll interval (default 1 s, `--poll-interval` or `AMP_POLL_INTERVAL`) and reloads when it has moved. Polling is one single-row read per replica per interval, works on any database, and catches up after a restart or a missed change. On reload, a replica rebuilds an immutable snapshot of routes, hooks, subscriptions, capabilities and grants, and swaps it in atomically. Open consoles are told over SSE and re-render.
 
-**Upgrading** means shipping a new binary whose module version has new migration files. On boot, under the same lock, the core applies any pending migrations for installed modules. Use expand/contract migrations, so that old and new replicas can run side by side during a rolling deploy. Applied files are checksummed and must never be edited.
+**Upgrading** means shipping a new binary whose modules may have new migration files. `amp migrate` applies them for every compiled-in module, each in its own transaction under `pg_advisory_xact_lock`, and records the new version of installed modules. Migrations of modules nobody installed run too, so they must work on empty tables. Use expand/contract migrations, so that old and new replicas can run side by side during a rolling deploy. Applied files are checksummed and must never be edited.
 
 ### Distributions
 
@@ -261,9 +273,10 @@ The integration tests register their own throwaway modules. They check:
 - dependency resolution;
 - that a second replica picks up changes;
 - the DB permission boundaries;
-- rollback of a failing migration;
+- that `amp migrate` prepares every compiled-in module and install applies no migration;
+- that a failing migration leaves no schema or migration record, and that serve refuses an unmigrated database;
 - disable and enable keeping data;
-- that purge drops the schema and role;
+- that purge empties the tables, revokes workload credentials, keeps the schema, and allows a reinstall without migrating;
 - upgrade on boot;
 - that an edited migration is refused.
 

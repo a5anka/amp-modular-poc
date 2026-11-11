@@ -39,6 +39,8 @@ func Main(distribution string) {
 	switch os.Args[1] {
 	case "serve":
 		err = serve(os.Args[2:])
+	case "migrate":
+		err = migrateCmd(os.Args[2:])
 	case "module", "modules", "mod":
 		err = moduleCmd(os.Args[2:])
 	case "version":
@@ -61,7 +63,8 @@ func usage(dist string) {
 	fmt.Fprintf(os.Stderr, `%s
 
 Usage:
-  amp serve [--addr :8080] [--db postgres://...] [--embedded-db] [--replica name] [--poll-interval 1s]
+  amp serve [--addr :8080] [--db postgres://...] [--embedded-db] [--replica name] [--poll-interval 1s] [--migrate=true]
+  amp migrate [--db postgres://...] [--embedded-db]      create/upgrade the schema of the core and of every compiled-in module
   amp module list
   amp module info <name>
   amp module install <name> [--with-deps]
@@ -71,6 +74,10 @@ Usage:
   amp module health <name>
   amp module credential <name> <workload>      mint a credential for an out-of-process workload
   amp version
+
+Module tables are created by migrate (at core install and upgrade), for every module compiled
+into this binary. Installing a module afterwards only activates it. serve migrates on start by
+default; in Kubernetes run "amp migrate" as a pre-install/pre-upgrade Job and serve with --migrate=false.
 
 serve --dev-workers runs modules' out-of-process workloads inside the core instead (dev only, no isolation).
 
@@ -89,6 +96,7 @@ func serve(args []string) error {
 	replica := fs.String("replica", os.Getenv("AMP_REPLICA"), "replica name shown in logs and the console")
 	poll := fs.Duration("poll-interval", envDuration("AMP_POLL_INTERVAL", modhost.DefaultPollInterval), "how often to check for module changes made by other replicas")
 	devWorkers := fs.Bool("dev-workers", false, "run modules' workloads in-process (development only: no isolation)")
+	migrate := fs.Bool("migrate", envBool("AMP_MIGRATE", true), "apply pending core and module migrations before serving (set false when a separate `amp migrate` step does it)")
 	_ = fs.Parse(args)
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -119,12 +127,20 @@ func serve(args []string) error {
 	if err := waitForDB(ctx, pool.Ping); err != nil {
 		return err
 	}
-	if err := db.Bootstrap(ctx, pool); err != nil {
-		return fmt.Errorf("core migrations: %w", err)
-	}
 	agents := core.NewAgents(pool)
 	host := modhost.New(pool, *dsn, agents, log)
 	host.PollInterval = *poll
+	if *migrate {
+		res, err := host.Migrate(ctx)
+		if err != nil {
+			return fmt.Errorf("migrate: %w", err)
+		}
+		applied := 0
+		for _, r := range res {
+			applied += r.Applied
+		}
+		log.Info("schema up to date", "modules", len(res), "migrationsApplied", applied)
+	}
 	if err := host.Boot(ctx); err != nil {
 		return fmt.Errorf("module host: %w", err)
 	}
@@ -375,7 +391,7 @@ func moduleCmd(args []string) error {
 			return err
 		}
 		if *purge {
-			fmt.Printf("✔ uninstalled %s and dropped schema %s\n", name, db.SchemaName(name))
+			fmt.Printf("✔ uninstalled %s: emptied the tables in %s and revoked its workload credentials (the schema stays, so reinstalling needs no migration)\n", name, db.SchemaName(name))
 		} else {
 			fmt.Printf("✔ uninstalled %s (schema %s kept; reinstall resumes with its data, --purge drops it)\n", name, db.SchemaName(name))
 		}
@@ -456,6 +472,59 @@ func envDuration(key string, def time.Duration) time.Duration {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
 		}
+	}
+	return def
+}
+
+// ---- migrate ----
+
+func migrateCmd(args []string) error {
+	fs := flag.NewFlagSet("migrate", flag.ExitOnError)
+	dsn := fs.String("db", os.Getenv("AMP_DB_URL"), "Postgres URL")
+	embedded := fs.Bool("embedded-db", false, "use the local development Postgres")
+	dataDir := fs.String("data-dir", envOr("AMP_DATA_DIR", defaultDataDir()), "embedded Postgres data directory")
+	_ = fs.Parse(args)
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	ctx := context.Background()
+	if *embedded {
+		pg, url, err := startEmbedded(*dataDir, log)
+		if err != nil {
+			return err
+		}
+		defer pg.Stop()
+		*dsn = url
+	}
+	if *dsn == "" {
+		return fmt.Errorf("set --db (or AMP_DB_URL), or use --embedded-db")
+	}
+	pool, err := db.Connect(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := waitForDB(ctx, pool.Ping); err != nil {
+		return err
+	}
+	host := modhost.New(pool, *dsn, core.NewAgents(pool), log)
+	start := time.Now()
+	res, err := host.Migrate(ctx)
+	for _, r := range res {
+		fmt.Printf("✔ %-14s schema %-18s %d/%d migration(s) applied now\n", r.Module, r.Schema, r.Applied, r.Total)
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Printf("schema up to date for the core and %d module(s) (%s). Installing a module now only activates it.\n",
+		len(res), time.Since(start).Round(time.Millisecond))
+	return nil
+}
+
+func envBool(key string, def bool) bool {
+	switch strings.ToLower(os.Getenv(key)) {
+	case "1", "true", "yes":
+		return true
+	case "0", "false", "no":
+		return false
 	}
 	return def
 }

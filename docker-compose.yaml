@@ -1,5 +1,8 @@
-# Two replicas of the core on one Postgres. Install a module through either
-# replica and watch the other one pick it up (LISTEN/NOTIFY), with no restart.
+# Two replicas of the core on one Postgres. A one-shot "migrate" service
+# creates the schema of the core and of every compiled-in module first (the
+# Kubernetes equivalent is a Helm pre-install/pre-upgrade Job). The replicas
+# then serve with --migrate=false. Install a module through either replica and
+# watch the other pick it up within a second (it polls core.generation).
 #
 #   docker compose up --build
 #   open http://localhost:8080 and http://localhost:8081
@@ -14,20 +17,30 @@ services:
       interval: 2s
       retries: 30
 
+  migrate:
+    build: .
+    command: ["migrate"]
+    environment:
+      AMP_DB_URL: postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable
+    depends_on:
+      postgres: { condition: service_healthy }
+
   amp-1:
     build: .
     environment:
       AMP_DB_URL: postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable
       AMP_REPLICA: amp-1
+      AMP_MIGRATE: "false"
     ports: ["8080:8080"]
     depends_on:
-      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
 
   amp-2:
     build: .
     environment:
       AMP_DB_URL: postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable
       AMP_REPLICA: amp-2
+      AMP_MIGRATE: "false"
     ports: ["8081:8080"]
     depends_on:
-      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }

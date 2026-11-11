@@ -129,11 +129,11 @@ func TestEvaluationWorkloads(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	if err := db.Bootstrap(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
 	agents := core.NewAgents(pool)
 	host := modhost.New(pool, dsn, agents, log)
+	if _, err := host.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if err := host.Boot(ctx); err != nil {
 		t.Fatal(err)
 	}

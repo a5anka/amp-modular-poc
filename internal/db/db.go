@@ -17,8 +17,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// lockKey is the advisory lock that serialises module lifecycle changes and
-// migrations across every replica of the core.
+// lockKey is the advisory lock that serialises migrations (and signing-key
+// creation) across replicas started at the same time. Module lifecycle
+// changes do not use it: they run no DDL and lock the generation row instead.
 const lockKey int64 = 0x616d70 // "amp"
 
 //go:embed migrations/*.sql
@@ -102,6 +103,30 @@ func Bootstrap(ctx context.Context, pool *pgxpool.Pool) error {
 	return tx.Commit(ctx)
 }
 
+// Querier is a pool or a transaction.
+type Querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// CorePending reports how many of the core's own migrations are not applied.
+func CorePending(ctx context.Context, q Querier) (int, error) {
+	sub, _ := fs.Sub(coreMigrations, "migrations")
+	ms, err := Load(sub)
+	if err != nil {
+		return 0, err
+	}
+	var exists bool
+	if err := q.QueryRow(ctx, `SELECT to_regclass('core.module_migrations') IS NOT NULL`).Scan(&exists); err != nil {
+		return 0, err
+	}
+	if !exists {
+		return len(ms), nil
+	}
+	p, err := Pending(ctx, q, "core", ms)
+	return len(p), err
+}
+
 // Migration is one SQL file.
 type Migration struct {
 	File     string
@@ -136,8 +161,8 @@ func Load(fsys fs.FS) ([]Migration, error) {
 
 // Pending returns the migrations not applied yet. An applied file whose
 // content changed is an error: migrations are append-only.
-func Pending(ctx context.Context, tx pgx.Tx, module string, ms []Migration) ([]Migration, error) {
-	rows, err := tx.Query(ctx, `SELECT file, checksum FROM core.module_migrations WHERE module = $1`, module)
+func Pending(ctx context.Context, q Querier, module string, ms []Migration) ([]Migration, error) {
+	rows, err := q.Query(ctx, `SELECT file, checksum FROM core.module_migrations WHERE module = $1`, module)
 	if err != nil {
 		return nil, err
 	}
@@ -229,40 +254,39 @@ func EnsureModuleSchema(ctx context.Context, tx pgx.Tx, module string) error {
 	return nil
 }
 
-// DropModuleSchema removes a module's schema, role and migration history.
-func DropModuleSchema(ctx context.Context, tx pgx.Tx, module string) error {
-	role := pgx.Identifier{RoleName(module)}.Sanitize()
-	schema := pgx.Identifier{SchemaName(module)}.Sanitize()
-	stmts := []string{
-		"DROP SCHEMA IF EXISTS " + schema + " CASCADE",
-	}
-	for _, s := range stmts {
-		if _, err := tx.Exec(ctx, s); err != nil {
-			return err
-		}
-	}
-	var exists bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)`, RoleName(module)).Scan(&exists); err != nil {
+// PurgeModuleData empties every table in a module's schema and revokes the
+// module's workload credentials. It runs no DDL that changes the schema: the
+// tables, the schema and the role stay, as created by Migrate, so the module
+// can be installed again without migrating. TRUNCATE runs as the module role,
+// which owns the tables.
+func PurgeModuleData(ctx context.Context, tx pgx.Tx, module string) error {
+	rows, err := tx.Query(ctx, `SELECT tablename FROM pg_tables WHERE schemaname = $1 ORDER BY tablename`, SchemaName(module))
+	if err != nil {
 		return err
 	}
-	if exists {
-		for _, s := range []string{
-			"REVOKE ALL ON ALL TABLES IN SCHEMA core_api FROM " + role,
-			"REVOKE ALL ON SCHEMA core_api FROM " + role,
-			"DROP ROLE " + role,
-		} {
-			if _, err := tx.Exec(ctx, s); err != nil {
-				return fmt.Errorf("%s: %w", s, err)
+	tables, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	if len(tables) > 0 {
+		var ids []string
+		for _, t := range tables {
+			ids = append(ids, pgx.Identifier{SchemaName(module), t}.Sanitize())
+		}
+		stmts := []string{
+			"SET LOCAL ROLE " + pgx.Identifier{RoleName(module)}.Sanitize(),
+			"TRUNCATE " + strings.Join(ids, ", ") + " RESTART IDENTITY",
+			"RESET ROLE",
+		}
+		for _, st := range stmts {
+			if _, err := tx.Exec(ctx, st); err != nil {
+				return fmt.Errorf("%s: %w", st, err)
 			}
 		}
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM core.module_migrations WHERE module = $1`, module); err != nil {
-		return err
-	}
-	// Purge also revokes the module's workload credentials and forgets its instances.
 	if _, err := tx.Exec(ctx, `UPDATE core.workload_credentials SET revoked_at = now() WHERE module = $1 AND revoked_at IS NULL`, module); err != nil {
 		return err
 	}
-	_, err := tx.Exec(ctx, `DELETE FROM core.workload_instances WHERE module = $1`, module)
+	_, err = tx.Exec(ctx, `DELETE FROM core.workload_instances WHERE module = $1`, module)
 	return err
 }

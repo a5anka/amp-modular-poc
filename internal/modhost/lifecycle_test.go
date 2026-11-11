@@ -80,13 +80,16 @@ func init() {
 		manifest:   modkit.Manifest{Name: "t-consumer", Version: "1.0.0", CoreAPI: modkit.CoreAPIVersion, Requires: []string{"store/v1"}},
 		migrations: sqlFS(map[string]string{"0001.sql": "CREATE TABLE secrets (v text); INSERT INTO secrets VALUES ('mine');"}),
 	})
-	modkit.Register(&testModule{
-		manifest: modkit.Manifest{Name: "t-broken", Version: "1.0.0", CoreAPI: modkit.CoreAPIVersion},
-		migrations: sqlFS(map[string]string{
-			"0001.sql": "CREATE TABLE ok (id int);",
-			"0002.sql": "CREATE TABLE oops (id int REFERENCES nowhere (id));",
-		}),
-	})
+}
+
+// broken is not registered: a binary containing it could never migrate.
+// TestFailingMigrationAppliesNothing builds a host with it explicitly.
+var broken = &testModule{
+	manifest: modkit.Manifest{Name: "t-broken", Version: "1.0.0", CoreAPI: modkit.CoreAPIVersion},
+	migrations: sqlFS(map[string]string{
+		"0001.sql": "CREATE TABLE ok (id int);",
+		"0002.sql": "CREATE TABLE oops (id int REFERENCES nowhere (id));",
+	}),
 }
 
 func startPostgres(t *testing.T) string {
@@ -124,10 +127,11 @@ func newHost(t *testing.T, ctx context.Context, dsn string) (*modhost.Host, *pgx
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	if err := db.Bootstrap(ctx, pool); err != nil {
+	h := modhost.New(pool, dsn, core.NewAgents(pool), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// Same as `amp serve` with the default --migrate=true.
+	if _, err := h.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	h := modhost.New(pool, dsn, core.NewAgents(pool), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err := h.Boot(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -153,6 +157,32 @@ func TestModuleLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	migrationRows := func() int {
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM core.module_migrations`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	t.Run("migrate prepares every compiled-in module before any install", func(t *testing.T) {
+		for _, s := range []string{"mod_t_store", "mod_t_consumer", "mod_t_upgrade"} {
+			if !schemaExists(t, ctx, pool, s) {
+				t.Fatalf("schema %s should exist after migrate", s)
+			}
+		}
+		var n int
+		_ = pool.QueryRow(ctx, `SELECT count(*) FROM core.modules`).Scan(&n)
+		if n != 0 {
+			t.Fatalf("migrate must not install anything, %d module rows", n)
+		}
+		rec := httptest.NewRecorder()
+		h1.ServeModule(rec, httptest.NewRequest("GET", "/m/t-store/items", nil))
+		if rec.Code != 404 {
+			t.Fatalf("a migrated but not installed module must not serve, got %d", rec.Code)
+		}
+	})
+
 	t.Run("required capability must be present", func(t *testing.T) {
 		_, err := h1.Install(ctx, "t-consumer", false)
 		if !modhost.IsResolveError(err) || !strings.Contains(err.Error(), "store/v1") {
@@ -160,7 +190,8 @@ func TestModuleLifecycle(t *testing.T) {
 		}
 	})
 
-	t.Run("install with deps creates schemas and mounts routes", func(t *testing.T) {
+	t.Run("install with deps activates and mounts routes, with no migrations", func(t *testing.T) {
+		before := migrationRows()
 		steps, err := h1.Install(ctx, "t-consumer", true)
 		if err != nil {
 			t.Fatal(err)
@@ -172,6 +203,9 @@ func TestModuleLifecycle(t *testing.T) {
 			if !schemaExists(t, ctx, pool, s) {
 				t.Fatalf("schema %s missing", s)
 			}
+		}
+		if after := migrationRows(); after != before {
+			t.Fatalf("install applied migrations: %d -> %d rows", before, after)
 		}
 		rec := httptest.NewRecorder()
 		h1.ServeModule(rec, httptest.NewRequest("GET", "/m/t-store/items", nil))
@@ -259,20 +293,6 @@ func TestModuleLifecycle(t *testing.T) {
 		}
 	})
 
-	t.Run("a failing migration rolls the whole install back", func(t *testing.T) {
-		if _, err := h1.Install(ctx, "t-broken", false); err == nil {
-			t.Fatal("expected migration failure")
-		}
-		if schemaExists(t, ctx, pool, "mod_t_broken") {
-			t.Fatal("schema of failed install must not exist")
-		}
-		var n int
-		_ = pool.QueryRow(ctx, `SELECT count(*) FROM core.modules WHERE name = 't-broken'`).Scan(&n)
-		if n != 0 {
-			t.Fatal("failed install must leave no module row")
-		}
-	})
-
 	t.Run("disabled module stops serving and keeps data", func(t *testing.T) {
 		if err := h1.Disable(ctx, "t-consumer"); err != nil {
 			t.Fatal(err)
@@ -303,27 +323,61 @@ func TestModuleLifecycle(t *testing.T) {
 		}
 	})
 
-	t.Run("purge drops schema and role", func(t *testing.T) {
+	t.Run("purge empties the tables and keeps the schema", func(t *testing.T) {
 		if _, err := pool.Exec(ctx, `INSERT INTO core.workload_credentials (module, workload, secret_hash) VALUES ('t-consumer', 'w', 'h')`); err != nil {
 			t.Fatal(err)
 		}
+		before := migrationRows()
 		if err := h1.Uninstall(ctx, "t-consumer", true); err != nil {
 			t.Fatal(err)
 		}
-		if schemaExists(t, ctx, pool, "mod_t_consumer") {
-			t.Fatal("schema still there after purge")
+		if !schemaExists(t, ctx, pool, "mod_t_consumer") {
+			t.Fatal("purge must keep the schema: it belongs to the binary, not the install")
 		}
-		var role bool
-		_ = pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'amp_mod_t_consumer')`).Scan(&role)
-		if role {
-			t.Fatal("role still there after purge")
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM mod_t_consumer.secrets`).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("purge must empty the tables: n=%d err=%v", n, err)
 		}
 		var live int
 		_ = pool.QueryRow(ctx, `SELECT count(*) FROM core.workload_credentials WHERE module = 't-consumer' AND revoked_at IS NULL`).Scan(&live)
 		if live != 0 {
 			t.Fatal("purge must revoke the module's workload credentials")
 		}
+		if after := migrationRows(); after != before {
+			t.Fatalf("purge must keep the migration history: %d -> %d", before, after)
+		}
+		// Installing again needs no migration.
+		steps, err := h1.Install(ctx, "t-consumer", false)
+		if err != nil || len(steps) != 1 || steps[0].Action != "install" {
+			t.Fatalf("reinstall after purge: %v %v", steps, err)
+		}
 	})
+}
+
+func TestFailingMigrationAppliesNothing(t *testing.T) {
+	dsn := startPostgres(t)
+	ctx := context.Background()
+	pool, err := db.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	h := modhost.NewWith(pool, dsn, core.NewAgents(pool), slog.New(slog.NewTextHandler(io.Discard, nil)), []modkit.Module{broken})
+	if _, err := h.Migrate(ctx); err == nil {
+		t.Fatal("expected migration failure")
+	}
+	if schemaExists(t, ctx, pool, "mod_t_broken") {
+		t.Fatal("a module whose migration failed must leave no schema behind")
+	}
+	var n int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM core.module_migrations WHERE module = 't-broken'`).Scan(&n)
+	if n != 0 {
+		t.Fatalf("no migration of the failed module may be recorded, got %d", n)
+	}
+	// A binary whose schema is not migrated refuses to serve.
+	if err := h.Boot(ctx); err == nil || !strings.Contains(err.Error(), "amp migrate") {
+		t.Fatalf("Boot must refuse an unmigrated schema, got %v", err)
+	}
 }
 
 func TestUpgradeOnBoot(t *testing.T) {
@@ -344,7 +398,15 @@ func TestUpgradeOnBoot(t *testing.T) {
 		"0001.sql": "CREATE TABLE notes (body text); INSERT INTO notes VALUES ('kept');",
 		"0002.sql": "ALTER TABLE notes ADD COLUMN author text NOT NULL DEFAULT 'unknown';",
 	})
-	newHost(t, ctx, dsn) // a replica of the new binary boots
+	// A replica of the new binary that skips migrate (serve --migrate=false,
+	// before the migrate Job ran) refuses to start.
+	p1, _ := db.Connect(ctx, dsn)
+	defer p1.Close()
+	stale := modhost.New(p1, dsn, core.NewAgents(p1), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := stale.Boot(ctx); err == nil || !strings.Contains(err.Error(), "t-upgrade: 1") {
+		t.Fatalf("want schema-behind error, got %v", err)
+	}
+	newHost(t, ctx, dsn) // the migrate step runs, then a replica of the new binary boots
 
 	var v, author, body string
 	if err := pool.QueryRow(ctx, `SELECT version FROM core.modules WHERE name = 't-upgrade'`).Scan(&v); err != nil || v != "1.1.0" {

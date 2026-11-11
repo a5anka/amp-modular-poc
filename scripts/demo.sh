@@ -99,7 +99,7 @@ sleep 0.3
 curl -s "$S/m/ai-gateway/bindings/$ID" | json
 curl -sf "$S/m/observability/traces?agentId=$ID" | json
 
-step "Uninstall keeps the data; --purge drops the schema"
+step "Uninstall keeps the data; --purge empties the tables (the schema stays: it was created by amp migrate, not by install)"
 $AMP module uninstall ai-gateway
 $AMP module install ai-gateway
 $AMP module uninstall ai-gateway --purge
