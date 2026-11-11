@@ -221,6 +221,7 @@ function Modules() {
             <dt>Schema</dt><dd><code>${m.schema}</code> · ${m.migrations?.length || 0} migration(s)</dd>
             <dt>Adds</dt><dd>${`${m.routes} route(s) when active, ${m.permissions?.length || 0} permission(s), ${m.ui?.nav?.length || 0} page(s), ${m.ui?.slots?.length || 0} slot contribution(s)`}</dd>
           </dl>
+          ${m.workloads?.length > 0 && html`<${Workloads} m=${m} manage=${manage} />`}
           ${manage && html`<div class="actions">
             ${(m.state === "available" || m.state === "uninstalled") && html`<button disabled=${busy} onClick=${() => act(m.name, "install")}>Install</button>`}
             ${m.state === "active" && html`<button class="secondary" disabled=${busy} onClick=${() => act(m.name, "disable")}>Disable</button>`}
@@ -230,6 +231,34 @@ function Modules() {
           </div>`}
         </div>`)}
     </div>`;
+}
+
+// Out-of-process workloads of a module: live instances, and credentials to start them.
+function Workloads({ m, manage }) {
+  const [secret, setSecret] = useState(null);
+  const [error, setError] = useState(null);
+  const health = m.health;
+  const live = Object.fromEntries((health?.workloads || []).map((w) => [w.name, w]));
+  const mint = async (wl) => {
+    setError(null);
+    try {
+      const r = await api(`/api/modules/${m.name}/workloads/${wl}/credentials`, { method: "POST" });
+      setSecret({ wl, value: r.credential });
+    } catch (err) { setError(err); }
+  };
+  return html`<div class="workloads">
+    <div class="wl-head">Runs outside the core
+      ${health && html` <span class=${"badge " + (health.status === "ok" ? "active" : "uninstalled")}>${health.status}</span>`}</div>
+    ${m.workloads.map((w) => html`<div class="wl">
+      <code>${w.name}</code> <span class="muted small">${w.kind}${w.trusted ? ", trusted" : ", untrusted"}${w.isolation ? ", " + w.isolation : ""}</span>
+      ${w.kind === "service" && m.state === "active" && html` <span class="small">${live[w.name]?.live ?? 0} live</span>`}
+      ${w.kind === "service" && m.state === "active" && manage && html` <a href="#" class="small" onClick=${(e) => { e.preventDefault(); mint(w.name); }}>credential</a>`}
+      ${w.kind === "job" && html` <span class="small muted">one per run, launched by eval-controller</span>`}
+    </div>`)}
+    ${secret && html`<pre class="small">AMP_WORKLOAD_CREDENTIAL=${secret.value} \
+  amp-eval-worker ${secret.wl.replace("eval-", "")} --core ${location.origin}</pre>`}
+    <${ErrorNote} error=${error} />
+  </div>`;
 }
 
 function Activity() {

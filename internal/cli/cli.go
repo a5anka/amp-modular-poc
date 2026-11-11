@@ -68,7 +68,11 @@ Usage:
   amp module disable <name>
   amp module enable <name>
   amp module uninstall <name> [--purge]
+  amp module health <name>
+  amp module credential <name> <workload>      mint a credential for an out-of-process workload
   amp version
+
+serve --dev-workers runs modules' out-of-process workloads inside the core instead (dev only, no isolation).
 
 Module commands talk to a running core: --server (or AMP_SERVER), default http://localhost:8080.
 `, dist)
@@ -83,6 +87,7 @@ func serve(args []string) error {
 	embedded := fs.Bool("embedded-db", false, "start a local Postgres for development (no Docker needed)")
 	dataDir := fs.String("data-dir", envOr("AMP_DATA_DIR", defaultDataDir()), "embedded Postgres data directory")
 	replica := fs.String("replica", os.Getenv("AMP_REPLICA"), "replica name shown in logs and the console")
+	devWorkers := fs.Bool("dev-workers", false, "run modules' workloads in-process (development only: no isolation)")
 	_ = fs.Parse(args)
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -135,6 +140,13 @@ func serve(args []string) error {
 		names = append(names, m.Manifest().Name)
 	}
 	log.Info("amp core listening", "addr", *addr, "replica", *replica, "compiledIn", names)
+	if *devWorkers {
+		port := *addr
+		if i := strings.LastIndex(port, ":"); i >= 0 {
+			port = port[i+1:]
+		}
+		host.EnableDevWorkloads("http://127.0.0.1:" + port)
+	}
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
@@ -216,6 +228,20 @@ func moduleCmd(args []string) error {
 		}
 	}
 	c := &client{base: strings.TrimRight(*server, "/"), role: *role}
+	if sub == "credential" {
+		if len(pos) != 2 {
+			return fmt.Errorf("usage: amp module credential <module> <workload>")
+		}
+		var res struct {
+			Credential string `json:"credential"`
+		}
+		if err := c.do("POST", "/api/modules/"+pos[0]+"/workloads/"+pos[1]+"/credentials", nil, &res); err != nil {
+			return err
+		}
+		fmt.Printf("Credential for %s/%s (shown once):\n  %s\n\nRun the workload with it, for example:\n  AMP_WORKLOAD_CREDENTIAL=%s amp-eval-worker %s --core %s\n",
+			pos[0], pos[1], res.Credential, res.Credential, strings.TrimPrefix(pos[1], "eval-"), c.base)
+		return nil
+	}
 	needName := func() (string, error) {
 		if len(pos) != 1 {
 			return "", fmt.Errorf("module %s: expected one module name", sub)
@@ -265,14 +291,64 @@ func moduleCmd(args []string) error {
 		if err := c.do("POST", "/api/modules/"+name+"/install"+q, nil, &res); err != nil {
 			return err
 		}
+		var next []string
 		for _, s := range res.Steps {
 			var m modhost.ModuleInfo
 			_ = c.do("GET", "/api/modules/"+s.Module, nil, &m)
 			fmt.Printf("✔ %s %s@%s: schema %s, %d migration(s), %d route(s), %d permission(s), %d nav item(s), %d slot(s)\n",
 				s.Action, m.Name, m.Version, m.Schema, len(m.Migrations), m.Routes, len(m.Permissions), navCount(m), slotCount(m))
+			for _, wl := range m.Workloads {
+				if wl.Kind == "service" {
+					next = append(next, fmt.Sprintf("  amp module credential %s %s   # then run the %s workload", m.Name, wl.Name, wl.Name))
+				}
+			}
 		}
 		fmt.Printf("active on all replicas at generation %d (%s); open consoles update without a reload\n",
 			res.Generation, time.Since(start).Round(time.Millisecond))
+		if len(next) > 0 {
+			time.Sleep(1500 * time.Millisecond)
+			var hl modhost.Health
+			_ = c.do("GET", "/api/modules/"+name+"/health", nil, &hl)
+			if hl.Status == "ok" {
+				fmt.Println("workloads connected (in-process dev workers)")
+				return nil
+			}
+			fmt.Println("\nThis module has workloads that run outside the core. Until they connect it reports \"degraded\".")
+			fmt.Println("Next (or start the core with --dev-workers for local use):")
+			for _, n := range next {
+				fmt.Println(n)
+			}
+		}
+		return nil
+	case "health":
+		name, err := needName()
+		if err != nil {
+			return err
+		}
+		var h modhost.Health
+		if err := c.do("GET", "/api/modules/"+name+"/health", nil, &h); err != nil {
+			return err
+		}
+		fmt.Printf("%s: %s", name, h.Status)
+		if len(h.Reasons) > 0 {
+			fmt.Printf(" (%s)", strings.Join(h.Reasons, "; "))
+		}
+		fmt.Println()
+		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		if len(h.Workloads) > 0 {
+			fmt.Fprintln(tw, "WORKLOAD\tKIND\tTRUSTED\tISOLATION\tLIVE\tINSTANCES")
+			for _, wl := range h.Workloads {
+				live := fmt.Sprint(wl.Live)
+				if wl.Kind == "job" {
+					live = "per run"
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%v\t%s\t%s\t%s\n", wl.Name, wl.Kind, wl.Trusted, dashS(wl.Isolation), live, dash(wl.Instances))
+			}
+		}
+		_ = tw.Flush()
+		for k, v := range h.Detail {
+			fmt.Printf("  %s: %v\n", k, v)
+		}
 		return nil
 	case "enable", "disable":
 		name, err := needName()
@@ -318,6 +394,13 @@ func slotCount(m modhost.ModuleInfo) int {
 		return 0
 	}
 	return len(m.UI.Slots)
+}
+
+func dashS(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func dash(xs []string) string {

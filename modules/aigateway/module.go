@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io/fs"
 	"net/http"
 	"slices"
@@ -94,6 +95,10 @@ func (*Module) Activate(_ context.Context, rt modkit.Runtime) error {
 	rt.Handle("GET", "/bindings/{agentId}", "providers.read", s.getBinding)
 	rt.Handle("PUT", "/bindings/{agentId}", "bindings.write", s.putBinding)
 	rt.Handle("DELETE", "/bindings/{agentId}", "bindings.write", s.deleteBinding)
+	// Called by other modules' workloads (e.g. evaluation runs) with a
+	// core-issued token whose audience includes ai-gateway. Stands in for the
+	// gateway runtime's LLM route, which verifies the same tokens via JWKS.
+	rt.HandleInternal("POST", "/judge", "llm.invoke", s.judge)
 
 	rt.Hook("agent", modkit.Validate, s.validateAgent)
 	rt.Hook("agent", modkit.Finalize, s.finalizeAgent)
@@ -269,6 +274,35 @@ func (s *service) onAgentCreated(ctx context.Context, e modkit.Event) error {
 	}
 	s.rt.Logger().Info("binding agent to LLM provider", "agent", d.Agent.Name, "provider", b.Provider, "model", b.Model)
 	return s.store(ctx, d.Agent.ID, b)
+}
+
+// judge simulates an LLM-judge call routed through the AI Gateway. It shows
+// the gateway accepting a run token minted by another module; it does not
+// call a real model.
+func (s *service) judge(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AgentID string `json:"agentId"`
+		Prompt  string `json:"prompt"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		modkit.WriteError(w, 400, "invalid JSON")
+		return
+	}
+	b, ok, err := s.BindingFor(r.Context(), req.AgentID)
+	if err != nil {
+		modkit.WriteError(w, 500, err.Error())
+		return
+	}
+	if !ok {
+		modkit.WriteError(w, 422, "agent has no LLM binding")
+		return
+	}
+	c, _ := modkit.ClaimsFrom(r.Context())
+	h := fnv.New32a()
+	h.Write([]byte(req.Prompt))
+	score := 0.6 + float64(h.Sum32()%36)/100
+	s.rt.Logger().Info("judge call metered", "caller", c.Subject, "issuedBy", c.Module, "provider", b.Provider, "model", b.Model)
+	modkit.WriteJSON(w, 200, map[string]any{"score": score, "provider": b.Provider, "model": b.Model})
 }
 
 // finalizeAgent removes the module's data for an agent that is being

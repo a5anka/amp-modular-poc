@@ -1,0 +1,105 @@
+# Evaluation module workloads on Kubernetes. ILLUSTRATIVE: written for the
+# design review, not applied to a cluster in this PoC.
+#
+# Two Deployments (they scale differently and need different permissions):
+#   eval-controller  creates one Job per isolated run; the only thing with RBAC
+#   shared-worker    built-in evaluators only; no Kubernetes permissions
+# Isolated runs: gVisor RuntimeClass, no service-account token, egress only to
+# the core and the AI Gateway.
+#
+# Credentials: amp module credential evaluation eval-controller / shared-worker
+#   kubectl -n amp-eval create secret generic eval-credentials \
+#     --from-literal=controller=amw_... --from-literal=shared-worker=amw_...
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: amp-eval
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eval-controller
+  namespace: amp-eval
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eval-controller
+  namespace: amp-eval
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eval-controller
+  namespace: amp-eval
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: eval-controller }
+subjects:
+  - { kind: ServiceAccount, name: eval-controller, namespace: amp-eval }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eval-controller
+  namespace: amp-eval
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: eval-controller } }
+  template:
+    metadata: { labels: { app: eval-controller } }
+    spec:
+      serviceAccountName: eval-controller
+      containers:
+        - name: controller
+          image: ghcr.io/a5anka/amp-eval-worker:0.2.0   # pinned by evaluation 0.2.0
+          args: ["controller", "--runner", "kubernetes", "--runtime-class", "gvisor"]
+          env:
+            - { name: AMP_CORE_URL, value: "http://amp.amp.svc:8080" }
+            - { name: AMP_EVAL_IMAGE, value: "ghcr.io/a5anka/amp-eval-worker:0.2.0" }
+            - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+            - { name: AMP_WORKLOAD_CREDENTIAL, valueFrom: { secretKeyRef: { name: eval-credentials, key: controller } } }
+          resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 128Mi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shared-worker
+  namespace: amp-eval
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: shared-worker } }
+  template:
+    metadata: { labels: { app: shared-worker } }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: worker
+          image: ghcr.io/a5anka/amp-eval-worker:0.2.0
+          args: ["shared-worker"]
+          env:
+            - { name: AMP_CORE_URL, value: "http://amp.amp.svc:8080" }
+            - { name: AMP_WORKLOAD_CREDENTIAL, valueFrom: { secretKeyRef: { name: eval-credentials, key: shared-worker } } }
+          resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { memory: 256Mi } }
+---
+# Isolated run pods (created by eval-controller, labelled amp.wso2.com/lane=isolated)
+# may only reach DNS, the core and the AI Gateway.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: isolated-runs-egress
+  namespace: amp-eval
+spec:
+  podSelector: { matchLabels: { amp.wso2.com/lane: isolated } }
+  policyTypes: ["Ingress", "Egress"]
+  ingress: []
+  egress:
+    - to: [{ namespaceSelector: {}, podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+      ports: [{ protocol: UDP, port: 53 }]
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: amp } } }]
+      ports: [{ protocol: TCP, port: 8080 }]

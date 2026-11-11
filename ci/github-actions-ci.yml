@@ -12,6 +12,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: actions/setup-python@v5   # custom evaluators in the e2e test
+        with:
+          python-version: "3.13"
       - name: Cache embedded Postgres binaries
         uses: actions/cache@v4
         with:
@@ -29,5 +32,11 @@ jobs:
           for i in $(seq 1 60); do curl -sf localhost:8080/healthz && break; sleep 1; done
           ./amp module install evaluation --with-deps
           ./amp module install ai-gateway
+          ./amp module health evaluation | grep -q degraded   # no workloads yet
+          go build -o amp-eval-worker ./cmd/amp-eval-worker
+          AMP_WORKLOAD_CREDENTIAL=$(./amp module credential evaluation shared-worker | sed -n 2p | tr -d ' ') ./amp-eval-worker shared-worker &
+          AMP_WORKLOAD_CREDENTIAL=$(./amp module credential evaluation eval-controller | sed -n 2p | tr -d ' ') ./amp-eval-worker controller &
+          for i in $(seq 1 30); do ./amp module health evaluation | grep -q "evaluation: ok" && break; sleep 1; done
+          ./amp module health evaluation | grep -q "evaluation: ok"
           ./amp module list
           curl -sf localhost:8080/api/ui-manifest | grep -q '"evaluation"'

@@ -53,3 +53,8 @@ dd { margin: 0; }
 .score { font-weight: 600; }
 .nowrap { white-space: nowrap; }
 .loading { padding: 20px; color: #64748b; }
+textarea.code { font-family: ui-monospace, Menlo, monospace; font-size: 12px; width: 100%; padding: 8px; border: 1px solid #cbd5e1; border-radius: 6px; }
+.workloads { border-top: 1px solid #f1f5f9; margin-top: 8px; padding-top: 6px; font-size: 12px; }
+.wl-head { color: #64748b; margin-bottom: 4px; }
+.wl { margin: 2px 0; }
+.workloads pre { background: #0f172a; color: #e2e8f0; padding: 8px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; }

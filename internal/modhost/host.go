@@ -65,6 +65,12 @@ type Host struct {
 	tagMu sync.Mutex
 	tags  map[string]string
 
+	keys *keyring
+
+	devMu   sync.Mutex
+	devURL  string
+	devRuns map[string]context.CancelFunc
+
 	Bus *Broadcaster
 }
 
@@ -116,7 +122,7 @@ func New(pool *pgxpool.Pool, dsn string, core modkit.CoreAPI, log *slog.Logger) 
 		pool: pool, dsn: dsn, log: log, core: core,
 		mods: map[string]modkit.Module{}, manifests: map[string]modkit.Manifest{},
 		pools: map[string]*pgxpool.Pool{}, states: map[string]string{}, dbVer: map[string]string{},
-		v: newView(), Bus: NewBroadcaster(), tags: map[string]string{},
+		v: newView(), Bus: NewBroadcaster(), tags: map[string]string{}, devRuns: map[string]context.CancelFunc{},
 	}
 	for _, m := range modkit.Registered() {
 		mf := m.Manifest()
@@ -195,6 +201,9 @@ func flatten(rs map[string]rowState) map[string]string {
 // migrations, loads the active set, and starts following lifecycle changes
 // made by other replicas.
 func (h *Host) Boot(ctx context.Context) error {
+	if err := h.loadKeys(ctx); err != nil {
+		return fmt.Errorf("signing keys: %w", err)
+	}
 	if err := h.upgradeInstalled(ctx); err != nil {
 		return err
 	}
@@ -374,6 +383,7 @@ func (h *Host) Reload(ctx context.Context) error {
 	}
 	h.mu.Unlock()
 	h.log.Info("modules loaded", "generation", gen, "active", v.active)
+	h.syncDevWorkloads(v.active)
 	if changed {
 		h.Bus.Send("modules.changed", map[string]any{"generation": gen, "active": v.active})
 	}
@@ -561,6 +571,37 @@ func (r *runtime) Handle(method, path, perm string, fn http.HandlerFunc) {
 	})
 }
 
+func (r *runtime) HandleInternal(method, path, scope string, fn http.HandlerFunc) {
+	full := qualify(r.name, scope)
+	pattern := fmt.Sprintf("%s /m/%s/internal%s", method, r.name, path)
+	r.v.routes[r.name]++
+	r.v.mux.HandleFunc(pattern, func(w http.ResponseWriter, req *http.Request) {
+		tok, ok := strings.CutPrefix(req.Header.Get("Authorization"), "Bearer ")
+		if !ok {
+			modkit.WriteError(w, http.StatusUnauthorized, "internal route: bearer token required")
+			return
+		}
+		c, err := r.h.VerifyToken(tok, r.name)
+		if err != nil {
+			modkit.WriteError(w, http.StatusUnauthorized, err.Error())
+			return
+		}
+		if !c.HasScope(full) {
+			modkit.WriteError(w, http.StatusForbidden, "token lacks scope "+full)
+			return
+		}
+		fn(w, req.WithContext(modkit.WithClaims(req.Context(), c)))
+	})
+}
+
+func (r *runtime) Can(ctx context.Context, perm string) bool {
+	return r.h.Can(modkit.PrincipalFrom(ctx).Role, qualify(r.name, perm))
+}
+
+func (r *runtime) IssueToken(_ context.Context, t modkit.TokenRequest) (string, error) {
+	return r.h.issue(r.name, "", t.Subject, t.Scopes, t.TTL, t.Claims)
+}
+
 func (r *runtime) Hook(resource string, phase modkit.Phase, fn modkit.HookFunc) {
 	k := resource + "/" + string(phase)
 	r.v.hooks[k] = append(r.v.hooks[k], hookEntry{r.name, fn})
@@ -671,6 +712,7 @@ type ModuleInfo struct {
 	Routes           int      `json:"routes"`
 	Migrations       []string `json:"migrations"`
 	Schema           string   `json:"schema"`
+	Health           *Health  `json:"health,omitempty"`
 }
 
 // List describes every module compiled into the binary.
@@ -703,6 +745,57 @@ func (h *Host) Get(name string) (ModuleInfo, bool) {
 		}
 	}
 	return ModuleInfo{}, false
+}
+
+// WithHealth adds live health to module infos.
+func (h *Host) WithHealth(ctx context.Context, ms []ModuleInfo) []ModuleInfo {
+	for i := range ms {
+		if ms[i].State == StateActive {
+			hl := h.ModuleHealth(ctx, ms[i].Name)
+			ms[i].Health = &hl
+		}
+	}
+	return ms
+}
+
+// EnableDevWorkloads makes the host run the in-process dev workloads of
+// active modules (`amp serve --dev-workers`). They talk to coreURL over HTTP.
+func (h *Host) EnableDevWorkloads(coreURL string) {
+	h.devMu.Lock()
+	h.devURL = coreURL
+	h.devMu.Unlock()
+	h.syncDevWorkloads(h.current().active)
+}
+
+func (h *Host) syncDevWorkloads(active []string) {
+	h.devMu.Lock()
+	defer h.devMu.Unlock()
+	if h.devURL == "" {
+		return
+	}
+	for name, cancel := range h.devRuns {
+		if !contains(active, name) {
+			cancel()
+			delete(h.devRuns, name)
+			h.log.Info("dev workloads stopped", "module", name)
+		}
+	}
+	for _, name := range active {
+		dw, ok := h.mods[name].(modkit.DevWorkloads)
+		if !ok || h.devRuns[name] != nil {
+			continue
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		h.devRuns[name] = cancel
+		env := modkit.DevEnv{CoreURL: h.devURL, Logger: h.log.With("module", name, "dev-workload", true),
+			Credential: func(ctx context.Context, wl string) (string, error) { return h.CreateCredential(ctx, name, wl) }}
+		go func() {
+			if err := dw.RunDevWorkloads(ctx, env); err != nil && ctx.Err() == nil {
+				h.log.Error("dev workloads stopped", "module", name, "err", err)
+			}
+		}()
+		h.log.Info("dev workloads started in-process (no isolation: dev only)", "module", name)
+	}
 }
 
 // IsResolveError reports whether err is a user-facing lifecycle error.

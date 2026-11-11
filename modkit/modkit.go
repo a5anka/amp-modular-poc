@@ -55,6 +55,46 @@ type Manifest struct {
 	Events []string `json:"events,omitempty"`
 
 	UI *UI `json:"ui,omitempty"`
+
+	// Workloads are the parts of the module that run outside the core binary,
+	// for code that must be isolated (evaluator code) or scaled separately.
+	// The module's control part (API, data, UI, hooks) always stays in-process.
+	Workloads []Workload `json:"workloads,omitempty"`
+}
+
+// WorkloadKind says how a workload runs.
+type WorkloadKind string
+
+const (
+	// Service is long-running (a Deployment). Instances register, heartbeat
+	// and are counted for module health.
+	Service WorkloadKind = "service"
+	// Job runs once per unit of work (one evaluation run), launched by
+	// another workload. Jobs authenticate with run tokens, not credentials.
+	Job WorkloadKind = "job"
+)
+
+// Workload declares one out-of-process part of a module.
+type Workload struct {
+	Name string       `json:"name"`
+	Kind WorkloadKind `json:"kind"`
+	// Trusted workloads run first-party code only. Untrusted ones run user
+	// code and must be isolated.
+	Trusted bool `json:"trusted"`
+	// Image is pinned by the module version, so upgrading the binary
+	// upgrades the workloads it launches.
+	Image string `json:"image,omitempty"`
+	// Isolation and Egress document the sandbox the platform must provide.
+	Isolation string `json:"isolation,omitempty"` // e.g. "gvisor"
+	Egress    string `json:"egress,omitempty"`    // e.g. "core+gateway"
+	// Scopes the workload's tokens carry (module-local names).
+	Scopes []string `json:"scopes,omitempty"`
+	// Protocols this module version accepts from the workload, newest first.
+	// Accepting N and N-1 lets old and new workers overlap during a rollout.
+	Protocols []string `json:"protocols,omitempty"`
+	// Required services make the module "degraded" when no instance is connected.
+	Required    bool   `json:"required,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 // Permission is a module-defined permission.
@@ -185,11 +225,89 @@ type Runtime interface {
 	// Publish emits an event declared in the manifest.
 	Publish(ctx context.Context, eventType string, data any) error
 
+	// Can reports whether the caller of the current request holds perm (a
+	// module-local or "<module>:<name>" permission).
+	Can(ctx context.Context, perm string) bool
+
+	// HandleInternal mounts a route under /m/<module>/internal for the
+	// module's workloads. Callers present a core-issued bearer token whose
+	// audience includes this module and whose scopes include scope.
+	HandleInternal(method, path, scope string, h http.HandlerFunc)
+	// IssueToken mints a short-lived token for a workload or job, e.g. a
+	// run token for one evaluation run. The audience is this module plus the
+	// providers of capabilities it requires or optionally uses (so a run
+	// token can call the AI Gateway). Scopes are module-local names.
+	IssueToken(ctx context.Context, req TokenRequest) (string, error)
+
 	// Provide registers the implementation of a capability listed in Provides.
 	Provide(capability string, impl any)
 	// Capability resolves a capability at call time. ok is false when no
 	// active module provides it (always possible for optional ones).
 	Capability(name string) (impl any, ok bool)
+}
+
+// TokenRequest describes a token to mint.
+type TokenRequest struct {
+	Subject string            // e.g. "run:<id>"
+	Scopes  []string          // module-local scope names
+	TTL     time.Duration     // capped by the core
+	Claims  map[string]string // extra string claims, e.g. {"run": id}
+}
+
+// Claims are the verified claims of a workload or run token.
+type Claims struct {
+	Subject  string            `json:"sub"`
+	Module   string            `json:"mod"`
+	Workload string            `json:"wl,omitempty"`
+	Audience []string          `json:"aud"`
+	Scopes   []string          `json:"scopes"`
+	Extra    map[string]string `json:"ext,omitempty"`
+	Expiry   time.Time         `json:"-"`
+}
+
+// HasScope reports whether the token carries scope (qualified "<module>:<name>").
+func (c Claims) HasScope(scope string) bool {
+	for _, s := range c.Scopes {
+		if s == scope {
+			return true
+		}
+	}
+	return false
+}
+
+type claimsKey struct{}
+
+// WithClaims stores verified token claims in a context (used by the core).
+func WithClaims(ctx context.Context, c Claims) context.Context {
+	return context.WithValue(ctx, claimsKey{}, c)
+}
+
+// ClaimsFrom returns the token claims of an internal request.
+func ClaimsFrom(ctx context.Context) (Claims, bool) {
+	c, ok := ctx.Value(claimsKey{}).(Claims)
+	return c, ok
+}
+
+// DevWorkloads is optionally implemented by modules whose workloads can run
+// in-process for local development (`amp serve --dev-workers`). They still
+// talk to the core over HTTP with real credentials, so the protocol is the
+// same as in production; only the process boundary is missing.
+type DevWorkloads interface {
+	RunDevWorkloads(ctx context.Context, env DevEnv) error
+}
+
+// DevEnv is what the core gives dev workloads.
+type DevEnv struct {
+	CoreURL string
+	// Credential mints a workload credential for one of the module's workloads.
+	Credential func(ctx context.Context, workload string) (string, error)
+	Logger     *slog.Logger
+}
+
+// HealthReporter is optionally implemented by modules that add detail to
+// their health, e.g. queue depth per lane.
+type HealthReporter interface {
+	Health(ctx context.Context, rt Runtime) map[string]any
 }
 
 // Lookup resolves a capability and asserts its contract type.

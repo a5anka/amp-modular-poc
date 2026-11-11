@@ -282,6 +282,9 @@ func TestModuleLifecycle(t *testing.T) {
 }
 
 func TestUpgradeOnBoot(t *testing.T) {
+	// The test mutates the registered module to simulate a new release; reset it so -count=N works.
+	upgradable.manifest.Version = "1.0.0"
+	upgradable.migrations = sqlFS(map[string]string{"0001.sql": "CREATE TABLE notes (body text); INSERT INTO notes VALUES ('kept');"})
 	dsn := startPostgres(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

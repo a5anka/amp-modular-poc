@@ -79,6 +79,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/modules/{name}/enable", s.need("modules:manage", s.enableModule))
 	mux.HandleFunc("POST /api/modules/{name}/disable", s.need("modules:manage", s.disableModule))
 	mux.HandleFunc("DELETE /api/modules/{name}", s.need("modules:manage", s.uninstallModule))
+	mux.HandleFunc("GET /api/modules/{name}/health", s.need("", s.moduleHealth))
+	mux.HandleFunc("POST /api/modules/{name}/workloads/{workload}/credentials", s.need("modules:manage", s.createCredential))
+
+	// Workload plane: authenticated by workload credentials and core-issued tokens, not user sessions.
+	mux.HandleFunc("POST /api/workloads/heartbeat", s.heartbeat)
+	mux.HandleFunc("GET /.well-known/jwks.json", s.host.ServeJWKS)
 
 	mux.HandleFunc("GET /api/agents", s.need("agents:read", s.listAgents))
 	mux.HandleFunc("POST /api/agents", s.need("agents:write", s.createAgent))
@@ -137,11 +143,47 @@ func (s *Server) uiManifest(w http.ResponseWriter, r *http.Request) {
 // ---- modules ----
 
 func (s *Server) listModules(w http.ResponseWriter, r *http.Request) {
-	modkit.WriteJSON(w, 200, s.host.List())
+	modkit.WriteJSON(w, 200, s.host.WithHealth(r.Context(), s.host.List()))
+}
+
+func (s *Server) moduleHealth(w http.ResponseWriter, r *http.Request) {
+	modkit.WriteJSON(w, 200, s.host.ModuleHealth(r.Context(), r.PathValue("name")))
+}
+
+func (s *Server) createCredential(w http.ResponseWriter, r *http.Request) {
+	secret, err := s.host.CreateCredential(r.Context(), r.PathValue("name"), r.PathValue("workload"))
+	if err != nil {
+		s.lifecycleError(w, err)
+		return
+	}
+	modkit.WriteJSON(w, 201, map[string]string{"module": r.PathValue("name"), "workload": r.PathValue("workload"), "credential": secret})
+}
+
+func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
+	var req modhost.HeartbeatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Credential == "" {
+		modkit.WriteError(w, 400, "credential is required")
+		return
+	}
+	res, err := s.host.Heartbeat(r.Context(), req)
+	var re *modhost.ResolveError
+	if errors.As(err, &re) {
+		modkit.WriteJSON(w, http.StatusUnauthorized, re)
+		return
+	}
+	if err != nil {
+		modkit.WriteError(w, 500, err.Error())
+		return
+	}
+	modkit.WriteJSON(w, 200, res)
 }
 
 func (s *Server) getModule(w http.ResponseWriter, r *http.Request) {
 	m, ok := s.host.Get(r.PathValue("name"))
+	if ok && m.State == modhost.StateActive {
+		hl := s.host.ModuleHealth(r.Context(), m.Name)
+		m.Health = &hl
+	}
 	if !ok {
 		modkit.WriteError(w, 404, "module "+r.PathValue("name")+" is not compiled into this distribution")
 		return
